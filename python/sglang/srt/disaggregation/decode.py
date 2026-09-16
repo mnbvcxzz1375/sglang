@@ -2846,7 +2846,12 @@ class SchedulerDisaggregationDecodeMixin:
         # so the cause is hardware or transport rather than the request. Serving
         # keeps going and drops just this request; CI fails instead, because a
         # single aborted request is easy to miss in a passing run.
-        if is_in_ci():
+        #
+        # Unless the mismatch is one the test suite asked for: the injector
+        # exists to exercise this abort path end to end, and CI runners export
+        # SGLANG_IS_IN_CI to the engines, so raising would kill the scheduler
+        # the injection tests are asserting stays up.
+        if is_in_ci() and envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.get() == 0.0:
             raise RuntimeError(msg)
         prepare_abort(
             req,

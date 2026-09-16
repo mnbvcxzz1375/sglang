@@ -347,6 +347,26 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         mock_abort.assert_not_called()
         sched.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
 
+    def test_injected_mismatch_aborts_without_killing_the_scheduler(self):
+        """The injector must not trip the in-CI raise it exists to exercise.
+
+        CI runners export SGLANG_IS_IN_CI to the engines, so without this the
+        fault-injection e2e tests would kill the scheduler they assert stays
+        up.
+        """
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(0xDEADBEEF, self.num_pages)
+        sched.waiting_queue = [req]
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.override(1.0),
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            self._run_once(sched)
+        self.assertEqual(sched.waiting_queue, [])
+        mock_abort.assert_called_once()
+
     def test_health_check_skips_checksum(self):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")

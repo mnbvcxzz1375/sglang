@@ -337,14 +337,20 @@ def corrupt_one_kv_row_for_test(scheduler, kv_page_indices_gpu: torch.Tensor) ->
     """
     if kv_page_indices_gpu.numel() == 0:
         return False
-    pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+    allocator = scheduler.token_to_kv_pool_allocator
+    pool = allocator.get_kvcache()
+    # The indices are page ids; the K/V buffers are indexed by token slot
+    # ([size, head_num, head_dim]), which only coincide at page_size == 1.
+    slot = int(kv_page_indices_gpu[0].item()) * allocator.page_size
     for name in ("k_buffer", "kv_buffer", "v_buffer"):
         buffers = getattr(pool, name, None)
         if not buffers:
             continue
-        row = int(kv_page_indices_gpu[0].item())
-        if row >= buffers[0].shape[0]:
+        buf = buffers[0]
+        if slot >= buf.shape[0] or not buf.is_contiguous():
             continue
-        buffers[0][row] += 1
+        # XOR over a byte view rather than arithmetic on the KV dtype: it is
+        # guaranteed to change the bytes and works for fp8 and friends.
+        buf.view(torch.uint8).reshape(buf.shape[0], -1)[slot] ^= 0xFF
         return True
     return False

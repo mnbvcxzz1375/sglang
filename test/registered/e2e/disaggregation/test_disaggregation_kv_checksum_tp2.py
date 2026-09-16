@@ -23,7 +23,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="4-gpu-h100")
+# base-c is the stage that owns the 4-gpu-h100 suite; base-b has no such
+# runner, and register_cuda_ci is AST-parsed, so a bad pair fails silently.
+register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-h100")
 
 _CHECKSUM_ARGS = ["--disaggregation-enable-kv-checksum"]
 
