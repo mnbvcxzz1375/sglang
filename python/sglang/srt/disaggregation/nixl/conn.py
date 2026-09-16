@@ -408,7 +408,6 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
-
     # Peers that registered a different number of aux buffers are
     # reported once, not once per transfer.
     _logged_aux_count_mismatch: set = set()

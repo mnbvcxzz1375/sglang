@@ -267,9 +267,7 @@ class KvChecksumComputer:
         assert len(state_data_ptrs) == len(state_item_lens)
         assert len(state_types) == len(state_data_ptrs)
         self.state_types = list(state_types)
-        self._state_data_ptrs = [
-            [int(ptr) for ptr in ptrs] for ptrs in state_data_ptrs
-        ]
+        self._state_data_ptrs = [[int(ptr) for ptr in ptrs] for ptrs in state_data_ptrs]
         self._state_item_lens = [
             [int(item_len) for item_len in lens] for lens in state_item_lens
         ]
@@ -293,9 +291,7 @@ class KvChecksumComputer:
             str(len(self._kv_data_ptrs)),
             ",".join(str(x) for x in self._kv_item_lens),
             ",".join(str(getattr(st, "value", st)) for st in self.state_types),
-            ";".join(
-                ",".join(str(x) for x in lens) for lens in self._state_item_lens
-            ),
+            ";".join(",".join(str(x) for x in lens) for lens in self._state_item_lens),
         ]
         digest = hashlib.blake2b("|".join(parts).encode(), digest_size=8).digest()
         # Keep it positive in the int64 metadata slot, and never 0 -- 0 is the

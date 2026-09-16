@@ -105,9 +105,7 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
         )
         self.assertEqual(computer._state_data_ptrs, [[55, 66], [77]])
         self.assertEqual(computer._state_item_lens, [[88, 99], [111]])
-        self.assertEqual(
-            computer.state_types, [StateType.SWA, StateType.BLOCK_SCALE]
-        )
+        self.assertEqual(computer.state_types, [StateType.SWA, StateType.BLOCK_SCALE])
 
     def test_signature_tracks_layout_and_is_never_zero(self):
         def make(**kw):
@@ -221,9 +219,7 @@ class TestKvChecksumComputer(unittest.TestCase):
         kv_idx = torch.tensor([0, 1], dtype=torch.int64, device=self.device)
         computer = _make_computer(kv, 32 * 2, [state], [[16 * 2]])
         kv_only = _make_computer(kv, 32 * 2)
-        self.assertEqual(
-            computer.compute(kv_idx, [None]), kv_only.compute(kv_idx)
-        )
+        self.assertEqual(computer.compute(kv_idx, [None]), kv_only.compute(kv_idx))
 
 
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
@@ -278,9 +274,7 @@ class TestPrefillHealthCheckChecksum(unittest.TestCase):
         ):
             sched.send_kv_chunk(req, last_chunk=True)
         # Digest 0 and signature 0: decode reads "no digest" and skips.
-        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(
-            req, 0, 0
-        )
+        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0, 0)
 
 
 class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
