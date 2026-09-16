@@ -29,6 +29,34 @@ register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
 _CHECKSUM_ARGS = ["--disaggregation-enable-kv-checksum"]
 
 
+def _decode_body(response: requests.Response):
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
+
+
+def _is_abort_result(status_code: int, body) -> bool:
+    """An aborted request can surface either way.
+
+    Same contract as `test_disaggregation_chunked_prefill_abort._is_abort_result`:
+    a 200 carrying `meta_info.finish_reason.type == "abort"`, or a 5xx whose
+    body names the abort. Asserting on the status code alone passes or fails
+    for the wrong reason.
+    """
+    if status_code == 200:
+        reason = (
+            body.get("meta_info", {}).get("finish_reason", {})
+            if isinstance(body, dict)
+            else {}
+        )
+        return isinstance(reason, dict) and reason.get("type") == "abort"
+    if status_code not in (500, 503):
+        return False
+    text = body if isinstance(body, str) else str(body)
+    return "abort" in text.lower()
+
+
 class TestDisaggregationKVChecksum(PDDisaggregationServerBase):
     """Checksum on, healthy transfers: nothing may change but the cost."""
 
@@ -78,7 +106,12 @@ class TestDisaggregationKVChecksum(PDDisaggregationServerBase):
                 timeout=120,
             )
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertNotIn("checksum", response.text.lower())
+            body = _decode_body(response)
+            self.assertFalse(
+                _is_abort_result(response.status_code, body),
+                f"healthy transfer was aborted: {response.text}",
+            )
+            self.assertTrue(body.get("text"), response.text)
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
@@ -101,7 +134,12 @@ class TestDisaggregationKVChecksum(PDDisaggregationServerBase):
                 timeout=120,
             )
             self.assertEqual(response.status_code, 200, response.text)
-            outputs.append(response.json()["text"])
+            body = _decode_body(response)
+            self.assertFalse(
+                _is_abort_result(response.status_code, body),
+                f"partial transfer was aborted: {response.text}",
+            )
+            outputs.append(body["text"])
         # Same prompt, greedy: a partial transfer must reconstruct the same KV.
         self.assertEqual(len(set(outputs)), 1, outputs)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
@@ -133,6 +171,10 @@ class TestDisaggregationKVChecksumOneSided(PDDisaggregationServerBase):
             timeout=120,
         )
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(
+            _is_abort_result(response.status_code, _decode_body(response)),
+            f"one-sided enable must skip the check, not abort: {response.text}",
+        )
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
@@ -163,10 +205,13 @@ class TestDisaggregationKVChecksumDetectsCorruption(PDDisaggregationServerBase):
             },
             timeout=120,
         )
-        # The request must fail rather than decode against the wrong KV. The
-        # engines stay up: a checksum mismatch aborts one request, not the
+        # The request must be aborted rather than decode against the wrong KV.
+        # The engines stay up: a checksum mismatch drops one request, not the
         # server.
-        self.assertNotEqual(response.status_code, 200, response.text)
+        self.assertTrue(
+            _is_abort_result(response.status_code, _decode_body(response)),
+            f"expected an abort, got {response.status_code}: {response.text}",
+        )
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 

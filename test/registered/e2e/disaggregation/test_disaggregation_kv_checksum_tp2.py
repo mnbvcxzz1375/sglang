@@ -30,6 +30,34 @@ register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-h100")
 _CHECKSUM_ARGS = ["--disaggregation-enable-kv-checksum"]
 
 
+def _decode_body(response: requests.Response):
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
+
+
+def _is_abort_result(status_code: int, body) -> bool:
+    """An aborted request can surface either way.
+
+    Same contract as `test_disaggregation_chunked_prefill_abort._is_abort_result`:
+    a 200 carrying `meta_info.finish_reason.type == "abort"`, or a 5xx whose
+    body names the abort. Asserting on the status code alone passes or fails
+    for the wrong reason.
+    """
+    if status_code == 200:
+        reason = (
+            body.get("meta_info", {}).get("finish_reason", {})
+            if isinstance(body, dict)
+            else {}
+        )
+        return isinstance(reason, dict) and reason.get("type") == "abort"
+    if status_code not in (500, 503):
+        return False
+    text = body if isinstance(body, str) else str(body)
+    return "abort" in text.lower()
+
+
 class _TP2Base(PDDisaggregationServerBase):
     prefill_tp_size = 2
     decode_tp_size = 2
@@ -83,7 +111,7 @@ class TestDisaggregationKVChecksumTP2SingleRankCorruption(_TP2Base):
         cls.launch_all()
 
     def test_single_rank_mismatch_does_not_hang(self):
-        statuses = []
+        outcomes = []
         for _ in range(8):
             response = requests.post(
                 self.lb_url + "/generate",
@@ -93,10 +121,13 @@ class TestDisaggregationKVChecksumTP2SingleRankCorruption(_TP2Base):
                 },
                 timeout=120,
             )
-            statuses.append(response.status_code)
+            outcomes.append(
+                _is_abort_result(response.status_code, _decode_body(response))
+            )
         # Some requests are aborted, which is the point; the engines survive and
-        # keep serving, which is what the reduce buys.
-        self.assertTrue(any(s != 200 for s in statuses), statuses)
+        # keep serving, which is what the reduce buys. With p=0.5 evaluated
+        # independently per decode rank, P(no abort in 8) is about 1.5e-5.
+        self.assertTrue(any(outcomes), outcomes)
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
