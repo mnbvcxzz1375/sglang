@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -40,6 +41,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
+    corrupt_one_kv_row_for_test,
     is_health_check_req,
     kv_page_indices_for_request,
     state_indices_for_request,
@@ -2194,9 +2196,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         idx = decode_req.metadata_buffer_index
         if self.scheduler.kv_checksum_computer is not None:
             digest, signature = self.metadata_buffers.get_kv_checksum(idx)
-            decode_req.req.expected_kv_checksum = (
-                digest if self._kv_checksum_comparable(signature) else 0
-            )
+            comparable = self._kv_checksum_comparable(signature)
+            decode_req.req.expected_kv_checksum = digest if comparable else 0
+            decode_req.req.kv_checksum_pending = comparable
         (
             output_id,
             cached_tokens,
@@ -2747,7 +2749,9 @@ class SchedulerDisaggregationDecodeMixin:
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
-        if computer is not None and self.waiting_queue:
+        if computer is not None and any(
+            req.kv_checksum_pending for req in self.waiting_queue
+        ):
             self._verify_kv_checksums(computer)
         return self._get_new_prebuilt_batch(running_batch)
 
@@ -2765,17 +2769,24 @@ class SchedulerDisaggregationDecodeMixin:
         per-rank by nature, so a rank-local drop leaves peers holding a
         different waiting queue and the next collective hangs; this is the same
         reason `poll_and_all_reduce` reduces the poll states it commits on.
+
+        The caller gates on `kv_checksum_pending`, which is set from the
+        prefill's layout signature rather than from the digest value, so every
+        rank enters (and reduces) on exactly the same iterations. A queue of
+        already-checked requests costs no collective at all.
         """
         queue = self.waiting_queue
         mismatched = [0] * len(queue)
         messages: Dict[int, str] = {}
+        corrupt_prob = envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.get()
 
         for i, req in enumerate(queue):
+            if not req.kv_checksum_pending:
+                continue
+            req.kv_checksum_pending = False
             if is_health_check_req(req):
                 continue
             expected = req.expected_kv_checksum
-            if expected == 0:
-                continue
             start_idx = req.disagg_decode_prefix_len
             seq_len = len(req.origin_input_ids)
             page_indices_gpu = kv_page_indices_for_request(
@@ -2784,6 +2795,13 @@ class SchedulerDisaggregationDecodeMixin:
             state_indices = state_indices_for_request(
                 self, req, seq_len, computer.state_types, start_idx
             )
+            if corrupt_prob > 0 and random.random() < corrupt_prob:
+                if corrupt_one_kv_row_for_test(self, page_indices_gpu):
+                    logger.warning(
+                        "SGLANG_TEST_DISAGG_KV_CORRUPT_PROB: clobbered a KV row "
+                        "of request %s to exercise the checksum",
+                        req.rid,
+                    )
             actual = computer.compute(page_indices_gpu, state_indices)
             # One check per handoff; see the docstring.
             req.expected_kv_checksum = 0

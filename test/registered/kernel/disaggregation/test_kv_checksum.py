@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
+    state_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -250,7 +251,7 @@ class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
         self.disagg_metadata_buffers = SimpleNamespace(set_kv_checksum=Mock())
 
 
-def _make_req(expected_chksum, num_input_tokens, rid="r0"):
+def _make_req(expected_chksum, num_input_tokens, rid="r0", pending=True):
     return SimpleNamespace(
         rid=rid,
         bootstrap_room=12345,
@@ -258,6 +259,7 @@ def _make_req(expected_chksum, num_input_tokens, rid="r0"):
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
         expected_kv_checksum=expected_chksum,
+        kv_checksum_pending=pending,
         disagg_decode_prefix_len=0,
         return_logprob=False,
     )
@@ -359,6 +361,20 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         mock_abort.assert_not_called()
         mock_release.assert_not_called()
 
+    def test_dsa_tail_is_excluded_not_mis_indexed(self):
+        """`get_dsa_tail_state_indices` returns a descriptor, not row indices.
+
+        Feeding it to the digest would read this request's row plus five rows
+        belonging to other, concurrently mutating requests. It has no index
+        mapping, so it must come back as None and be left out.
+        """
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(0, self.num_pages)
+        self.assertEqual(
+            state_indices_for_request(sched, req, self.num_pages, [StateType.DSA_TAIL]),
+            [None],
+        )
+
     def test_verified_once_then_cleared(self):
         """A handoff is checked on entry and not re-checked afterwards.
 
@@ -411,11 +427,19 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sentinel = object()
         self.assertIs(self._run_once(sched, batch_ret=sentinel), sentinel)
 
-    def test_zero_expected_skips_checksum(self):
+    def test_not_pending_skips_checksum_and_the_collective(self):
+        """An incomparable or already-checked handoff costs no collective."""
         sched = self._make_sched(_SENTINEL)
-        sched.waiting_queue = [_make_req(0, self.num_pages)]
-        self._run_once(sched)
+        sched.waiting_queue = [_make_req(0xDEADBEEF, self.num_pages, pending=False)]
+        reduced = []
+        with patch.object(
+            SchedulerDisaggregationDecodeMixin,
+            "_all_reduce_kv_checksum_mismatches",
+            lambda s, flags: reduced.append(flags) or flags,
+        ):
+            self._run_once(sched)
         self.assertEqual(len(sched.waiting_queue), 1)
+        self.assertEqual(reduced, [], "no request was pending; expected no reduce")
 
 
 _SENTINEL = object()

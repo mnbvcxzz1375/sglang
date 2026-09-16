@@ -1314,6 +1314,10 @@ class Req(ReqDllmMixin):
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
         self.expected_kv_checksum: int = 0
+        # Whether that digest is still owed a check. Set from the prefill's
+        # layout signature, which is identical on every rank, so the decision
+        # to run the checksum collective is rank-invariant.
+        self.kv_checksum_pending: bool = False
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False

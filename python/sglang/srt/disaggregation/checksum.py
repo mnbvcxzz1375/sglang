@@ -29,6 +29,15 @@ _FULL_KV_PAGE_STATES = (
 # State components addressed by sliding-window pages.
 _SWA_PAGE_STATES = (StateType.SWA, StateType.BLOCK_SCALE_SWA)
 
+# StateType.DSA_TAIL is deliberately absent. `get_dsa_tail_state_indices`
+# returns a *descriptor* -- [req_pool_idx, start_phys, first_n, 0, second_n,
+# tail_size] -- that the transfer backends decode into byte blocks, not a list
+# of rows. Feeding it to the digest would read this request's row plus five
+# rows belonging to other, concurrently mutating requests, and `req_pool_idx`
+# differs between the two engines anyway. Until it has a real index mapping it
+# is excluded on both sides, which is what the builder table's fallthrough
+# does.
+
 _warned_unaddressable: set = set()
 
 # Bump when the digest's meaning changes, so peers running different builds
@@ -134,13 +143,6 @@ def _state_index_builders(
         kv_full = scheduler.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
         return _to_page_indices_gpu(kv_full, device_page_size)
 
-    def _dsa_tail() -> Optional[torch.Tensor]:
-        from sglang.srt.disaggregation.utils import get_dsa_tail_state_indices
-
-        return _as_index_tensor(
-            get_dsa_tail_state_indices(pool, req_pool_idx, seq_len), device
-        )
-
     def _qsa_pending() -> Optional[torch.Tensor]:
         from sglang.srt.disaggregation.utils import get_qsa_pending_state_indices
 
@@ -181,7 +183,6 @@ def _state_index_builders(
     builders: Dict[StateType, Callable[[], Optional[torch.Tensor]]] = {
         StateType.MAMBA: _mamba,
         StateType.QSA_PENDING: _qsa_pending,
-        StateType.DSA_TAIL: _dsa_tail,
         StateType.SWA_RING: _swa_ring,
         StateType.DSV4_REQUEST_STATE: _c128_state,
     }
@@ -325,3 +326,25 @@ class KvChecksumComputer:
                 all_lens += lens
                 all_indices += [idx] * len(ptrs)
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)
+
+
+def corrupt_one_kv_row_for_test(scheduler, kv_page_indices_gpu: torch.Tensor) -> bool:
+    """Clobber one landed KV row, the way a slot reused mid-write would.
+
+    Test-only, behind SGLANG_TEST_DISAGG_KV_CORRUPT_PROB. Writes through the
+    pool's own buffers so the digest sees exactly what a real fault would
+    leave behind. Returns whether anything was corrupted.
+    """
+    if kv_page_indices_gpu.numel() == 0:
+        return False
+    pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+    for name in ("k_buffer", "kv_buffer", "v_buffer"):
+        buffers = getattr(pool, name, None)
+        if not buffers:
+            continue
+        row = int(kv_page_indices_gpu[0].item())
+        if row >= buffers[0].shape[0]:
+            continue
+        buffers[0][row] += 1
+        return True
+    return False

@@ -137,5 +137,39 @@ class TestDisaggregationKVChecksumOneSided(PDDisaggregationServerBase):
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
 
+class TestDisaggregationKVChecksumDetectsCorruption(PDDisaggregationServerBase):
+    """The true positive: a corrupted handoff must be caught, not decoded.
+
+    Without this the other cases all pass if `compute()` returned a constant.
+    The injected fault clobbers a landed KV row the way a slot reused
+    mid-write would, on the decode side, after the transfer completed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = list(_CHECKSUM_ARGS)
+        cls.extra_decode_args = list(_CHECKSUM_ARGS)
+        cls.extra_decode_env = {"SGLANG_TEST_DISAGG_KV_CORRUPT_PROB": "1.0"}
+        cls.launch_all()
+
+    def test_corrupted_kv_is_rejected(self):
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+            timeout=120,
+        )
+        # The request must fail rather than decode against the wrong KV. The
+        # engines stay up: a checksum mismatch aborts one request, not the
+        # server.
+        self.assertNotEqual(response.status_code, 200, response.text)
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
 if __name__ == "__main__":
     unittest.main()

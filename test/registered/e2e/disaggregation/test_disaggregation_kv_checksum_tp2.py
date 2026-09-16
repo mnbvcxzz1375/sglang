@@ -1,0 +1,103 @@
+"""KV checksum with TP > 1, where the mismatch all-reduce actually executes.
+
+The TP1 coverage in `test_disaggregation_kv_checksum.py` cannot exercise
+`_all_reduce_kv_checksum_mismatches` at all: with one rank per engine the
+collective takes its `world_size == 1` early return every time. Corruption is
+per-rank by nature, so the reduce is what keeps a single rank's mismatch from
+splitting the waiting queue and hanging the next collective -- it needs a
+multi-rank run to mean anything.
+
+Prefill on GPUs 0-1, decode on GPUs 2-3.
+"""
+
+import unittest
+from types import SimpleNamespace
+
+import requests
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+    assert_process_healthy,
+)
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+
+register_cuda_ci(est_time=600, stage="base-b", runner_config="4-gpu-h100")
+
+_CHECKSUM_ARGS = ["--disaggregation-enable-kv-checksum"]
+
+
+class _TP2Base(PDDisaggregationServerBase):
+    prefill_tp_size = 2
+    decode_tp_size = 2
+    decode_base_gpu_id = 2
+
+
+class TestDisaggregationKVChecksumTP2(_TP2Base):
+    """Healthy traffic under TP2: the reduce runs every batch and drops nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = list(_CHECKSUM_ARGS)
+        cls.extra_decode_args = list(_CHECKSUM_ARGS)
+        cls.launch_all()
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.lb_url,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.62)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
+class TestDisaggregationKVChecksumTP2SingleRankCorruption(_TP2Base):
+    """One rank's fault must abort the request on every rank, not hang.
+
+    The injection is probabilistic per request and evaluated independently on
+    each decode rank, so a mismatch seen by one rank and not its peer is the
+    normal case here -- which is exactly the split the all-reduce exists to
+    prevent. What must not happen is a hang: the engines stay responsive and
+    later requests still succeed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = list(_CHECKSUM_ARGS)
+        cls.extra_decode_args = list(_CHECKSUM_ARGS)
+        # Low enough that ranks routinely disagree about a given request.
+        cls.extra_decode_env = {"SGLANG_TEST_DISAGG_KV_CORRUPT_PROB": "0.5"}
+        cls.launch_all()
+
+    def test_single_rank_mismatch_does_not_hang(self):
+        statuses = []
+        for _ in range(8):
+            response = requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                },
+                timeout=120,
+            )
+            statuses.append(response.status_code)
+        # Some requests are aborted, which is the point; the engines survive and
+        # keep serving, which is what the reduce buys.
+        self.assertTrue(any(s != 200 for s in statuses), statuses)
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
+if __name__ == "__main__":
+    unittest.main()
