@@ -7,13 +7,14 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
 )
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import MetadataBuffers, aux_buffer_pair_count
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -67,23 +68,71 @@ class TestMetadataBuffers(unittest.TestCase):
 
     def test_set_get_kv_checksum_roundtrip(self):
         buf = _make_buf()
-        buf.set_kv_checksum(SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(0), 0)
+        buf.set_kv_checksum(
+            SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF, 0xABCDEF
+        )
+        self.assertEqual(buf.get_kv_checksum(1), (0xDEADBEEF, 0xABCDEF))
+        # An untouched row reads as "no digest".
+        self.assertEqual(buf.get_kv_checksum(0), (0, 0))
+
+
+class TestAuxBufferPairCount(unittest.TestCase):
+    """A peer with a different aux-buffer count must not walk off the list."""
+
+    def test_equal_counts_pass_through(self):
+        logged = set()
+        self.assertEqual(aux_buffer_pair_count(5, 5, logged, "t"), 5)
+        self.assertEqual(logged, set())
+
+    def test_mismatch_clamps_and_logs_once(self):
+        logged = set()
+        self.assertEqual(aux_buffer_pair_count(5, 6, logged, "t"), 5)
+        self.assertEqual(aux_buffer_pair_count(6, 5, logged, "t"), 5)
+        self.assertEqual(aux_buffer_pair_count(5, 6, logged, "t"), 5)
+        self.assertEqual(len(logged), 2)
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
-    def test_flattens_nested_state_descriptor_components(self):
+    def test_keeps_state_components_nested(self):
+        """Components must stay separable; one shared index tensor is wrong."""
         computer = KvChecksumComputer(
             torch.device("cpu"),
             kv_data_ptrs=[11, 22],
             kv_item_lens=[33, 44],
+            state_types=[StateType.SWA, StateType.BLOCK_SCALE],
             state_data_ptrs=[[55, 66], [77]],
             state_item_lens=[[88, 99], [111]],
         )
+        self.assertEqual(computer._state_data_ptrs, [[55, 66], [77]])
+        self.assertEqual(computer._state_item_lens, [[88, 99], [111]])
+        self.assertEqual(
+            computer.state_types, [StateType.SWA, StateType.BLOCK_SCALE]
+        )
 
-        self.assertEqual(computer._state_data_ptrs, [55, 66, 77])
-        self.assertEqual(computer._state_item_lens, [88, 99, 111])
+    def test_signature_tracks_layout_and_is_never_zero(self):
+        def make(**kw):
+            base = dict(
+                kv_data_ptrs=[1, 2],
+                kv_item_lens=[64, 64],
+                state_types=[StateType.SWA],
+                state_data_ptrs=[[3]],
+                state_item_lens=[[32]],
+                page_size=1,
+            )
+            base.update(kw)
+            return KvChecksumComputer(torch.device("cpu"), **base).signature
+
+        same = make()
+        self.assertNotEqual(same, 0)
+        self.assertEqual(same, make())
+        # A different TP width shows up as different per-page item lengths.
+        self.assertNotEqual(same, make(kv_item_lens=[32, 32]))
+        # A layer-sharded / PP prefill owns fewer buffers.
+        self.assertNotEqual(same, make(kv_data_ptrs=[1], kv_item_lens=[64]))
+        self.assertNotEqual(same, make(page_size=16))
+        self.assertNotEqual(
+            same, make(state_types=[], state_data_ptrs=[], state_item_lens=[])
+        )
 
 
 class TestKvChecksumHealthCheck(unittest.TestCase):
@@ -100,12 +149,15 @@ def _make_kv(num_layers, num_pages, page_elems, dtype=torch.float16):
     ]
 
 
-def _make_computer(kv, item_len, state=None, state_item_lens=None):
+def _make_computer(kv, item_len, state_components=None, state_item_lens=None):
+    """`state_components` is a list of per-component tensor lists."""
+    components = state_components or []
     return KvChecksumComputer(
         torch.device("cuda:0"),
         kv_data_ptrs=[t.data_ptr() for t in kv],
         kv_item_lens=[item_len] * len(kv),
-        state_data_ptrs=[t.data_ptr() for t in (state or [])],
+        state_types=[StateType.SWA] * len(components),
+        state_data_ptrs=[[t.data_ptr() for t in comp] for comp in components],
         state_item_lens=state_item_lens or [],
     )
 
@@ -132,57 +184,46 @@ class TestKvChecksumComputer(unittest.TestCase):
         kv[0][5, 0] += 1
         self.assertNotEqual(v1, computer.compute(idx))
 
-    def test_kv_plus_state_matches_reference(self):
-        kv = _make_kv(num_layers=2, num_pages=8, page_elems=32)
-        state = [
-            torch.randn(4, 16, dtype=torch.float16, device=self.device)
-            for _ in range(2)
-        ]
-        kv_idx = torch.tensor([0, 1, 2], dtype=torch.int64, device=self.device)
-        state_idx = torch.tensor([1], dtype=torch.int64, device=self.device)
-        kv_len, state_lens = 32 * 2, [16 * 2, 16 * 2]
-        computer = _make_computer(kv, kv_len, state, state_lens)
-        value = computer.compute(kv_idx, state_idx)
-        expected = _ref_strided_adler32(
-            kv + state,
-            [kv_idx] * len(kv) + [state_idx] * len(state),
-            [kv_len] * len(kv) + state_lens,
-        )
-        self.assertEqual(value, expected)
-        state[0][1, 0] += 1
-        self.assertNotEqual(value, computer.compute(kv_idx, state_idx))
+    def test_each_state_component_uses_its_own_indices(self):
+        """The regression for the shared-index bug.
 
-    def test_nested_state_components_match_reference(self):
+        Two components with unrelated row spaces: indexing the second with the
+        first's tensor reads the wrong rows, and the row counts differ so a
+        shared tensor would also run past the shorter buffer.
+        """
         kv = _make_kv(num_layers=1, num_pages=8, page_elems=32)
-        state_components = [
-            [torch.randn(4, 16, dtype=torch.float16, device=self.device)],
-            [
-                torch.randn(4, 8, dtype=torch.float16, device=self.device),
-                torch.randn(4, 12, dtype=torch.float16, device=self.device),
-            ],
-        ]
+        wide = [torch.randn(16, 16, dtype=torch.float16, device=self.device)]
+        narrow = [torch.randn(3, 8, dtype=torch.float16, device=self.device)]
         kv_idx = torch.tensor([0, 3, 7], dtype=torch.int64, device=self.device)
-        state_idx = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
-        state_tensors = [tensor for comp in state_components for tensor in comp]
-        kv_len = 32 * 2
-        state_lens = [[16 * 2], [8 * 2, 12 * 2]]
-        computer = KvChecksumComputer(
-            self.device,
-            kv_data_ptrs=[t.data_ptr() for t in kv],
-            kv_item_lens=[kv_len] * len(kv),
-            state_data_ptrs=[
-                [tensor.data_ptr() for tensor in comp] for comp in state_components
-            ],
-            state_item_lens=state_lens,
-        )
+        wide_idx = torch.tensor([15, 4], dtype=torch.int64, device=self.device)
+        narrow_idx = torch.tensor([2], dtype=torch.int64, device=self.device)
+        kv_len, wide_len, narrow_len = 32 * 2, 16 * 2, 8 * 2
 
-        value = computer.compute(kv_idx, state_idx)
+        computer = _make_computer(
+            kv, kv_len, [wide, narrow], [[wide_len], [narrow_len]]
+        )
+        value = computer.compute(kv_idx, [wide_idx, narrow_idx])
         expected = _ref_strided_adler32(
-            kv + state_tensors,
-            [kv_idx] * len(kv) + [state_idx] * len(state_tensors),
-            [kv_len] * len(kv) + [item for comp in state_lens for item in comp],
+            kv + wide + narrow,
+            [kv_idx] * len(kv) + [wide_idx, narrow_idx],
+            [kv_len] * len(kv) + [wide_len, narrow_len],
         )
         self.assertEqual(value, expected)
+
+        # Corruption in either component is still caught.
+        narrow[0][2, 0] += 1
+        self.assertNotEqual(value, computer.compute(kv_idx, [wide_idx, narrow_idx]))
+
+    def test_unaddressable_component_is_excluded(self):
+        """A `None` index drops that component rather than mis-indexing it."""
+        kv = _make_kv(num_layers=1, num_pages=8, page_elems=32)
+        state = [torch.randn(4, 16, dtype=torch.float16, device=self.device)]
+        kv_idx = torch.tensor([0, 1], dtype=torch.int64, device=self.device)
+        computer = _make_computer(kv, 32 * 2, [state], [[16 * 2]])
+        kv_only = _make_computer(kv, 32 * 2)
+        self.assertEqual(
+            computer.compute(kv_idx, [None]), kv_only.compute(kv_idx)
+        )
 
 
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
@@ -190,7 +231,9 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
+            page_size=1,
+            get_kvcache=lambda: SimpleNamespace(),
+            translate_kv_indices_for_transfer=lambda x: x,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
@@ -198,6 +241,8 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
         self.streamed_aborts = []
+        # Single-rank: the mismatch reduce is a no-op.
+        self.attn_tp_cpu_group = None
 
     def stream_output(self, reqs, return_logprob):
         self.streamed_aborts.extend(reqs)
@@ -217,6 +262,7 @@ def _make_req(expected_chksum, num_input_tokens, rid="r0"):
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
         expected_kv_checksum=expected_chksum,
+        disagg_decode_prefix_len=0,
         return_logprob=False,
     )
 
@@ -231,7 +277,10 @@ class TestPrefillHealthCheckChecksum(unittest.TestCase):
             lambda *args, **kwargs: None,
         ):
             sched.send_kv_chunk(req, last_chunk=True)
-        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0)
+        # Digest 0 and signature 0: decode reads "no digest" and skips.
+        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(
+            req, 0, 0
+        )
 
 
 class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
@@ -316,14 +365,51 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         mock_abort.assert_not_called()
         mock_release.assert_not_called()
 
-    def test_retract_re_verifies(self):
+    def test_verified_once_then_cleared(self):
+        """A handoff is checked on entry and not re-checked afterwards.
+
+        Regression for the retraction abort: a resumed request carries the
+        prefill-time digest, but its state has moved on -- mamba advances every
+        step, and with page_size > 1 the prompt's last partial page fills with
+        decoded tokens -- so a second check would abort healthy traffic.
+        """
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
         sched.waiting_queue = [req]
         self._run_once(sched)
-        self._run_once(sched)
+        self.assertEqual(req.expected_kv_checksum, 0)
+
+        # Stand in for decoding having moved the KV on, then a retraction that
+        # puts the request back on the queue. It must not be re-checked.
+        self.kv[0][0, 0] += 1
+        with (
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            self._run_once(sched)
         self.assertEqual(sched.waiting_queue, [req])
         self.assertEqual(sched.streamed_aborts, [])
+        mock_abort.assert_not_called()
+
+    def test_mismatch_decision_is_all_reduced(self):
+        """Every rank drops the same requests, even if only one saw the fault."""
+        sched = self._make_sched(_SENTINEL)
+        clean = _make_req(self.true_chksum, self.num_pages, rid="clean")
+        sched.waiting_queue = [clean]
+        # This rank's KV is fine; a peer reports position 0 as corrupt.
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+            patch.object(
+                SchedulerDisaggregationDecodeMixin,
+                "_all_reduce_kv_checksum_mismatches",
+                lambda s, flags: [1] * len(flags),
+            ),
+        ):
+            self._run_once(sched)
+        self.assertEqual(sched.waiting_queue, [])
+        self.assertEqual(sched.streamed_aborts, [clean])
 
     def test_disabled_delegates_to_batch_builder(self):
         sched = self._make_sched(computer=None)

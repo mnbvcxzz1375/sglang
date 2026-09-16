@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
-    page_indices_for_request,
+    kv_page_indices_for_request,
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -217,8 +217,10 @@ class PrefillBootstrapQueue:
                 device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
+                state_types=kv_args.state_types,
                 state_data_ptrs=kv_args.state_data_ptrs,
                 state_item_lens=kv_args.state_item_lens,
+                page_size=kv_args.page_size,
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -1302,10 +1304,21 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_range.end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
+                # Digest exactly what this handoff transfers. The prefill never
+                # sends [0, disagg_decode_prefix_len) -- decode filled those
+                # pages from its own cache, with bytes from a different prefill
+                # run -- so digesting them compares KV that never crossed.
+                start_idx = req.disagg_decode_prefix_len
+                page_indices_gpu = kv_page_indices_for_request(
+                    self, req, start_idx, end_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, computer.state_types, start_idx
+                )
                 value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+            self.disagg_metadata_buffers.set_kv_checksum(
+                req, value, computer.signature if value else 0
+            )
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(
